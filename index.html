@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Reflex Shot</title>
+  </head>
+  <body>
+    <h1>Reflex Shot</h1>
+    <p>
+      Mira com o mouse (o <b>+</b> acompanha). Clique para atirar.
+      <br />
+      <b>Enter</b> começa/pausa • <b>R</b> reinicia • <b>1</b> Pistola • <b>2</b> SMG • <b>3</b> Sniper
+    </p>
+
+    <div id="hud">
+      <b>Status:</b> <span id="status">Pronto</span> |
+      <b>Tempo:</b> <span id="time">60.0</span>s |
+      <b>Pontos:</b> <span id="score">0</span> |
+      <b>Streak:</b> <span id="streak">0</span> |
+      <b>Precisão:</b> <span id="acc">0</span>% |
+      <b>Headshots:</b> <span id="hs">0</span>
+    </div>
+
+    <p>
+      <b>Arma:</b> <span id="weaponName">Pistola</span> |
+      <b>Cadência:</b> <span id="weaponRate">3.5</span> tiros/s |
+      <b>Recuo:</b> <span id="weaponKick">médio</span>
+    </p>
+
+    <canvas id="game" width="900" height="520"></canvas>
+
+    <p id="log"></p>
+
+    <script>
+
+      const canvas = document.getElementById("game");
+      const ctx = canvas.getContext("2d");
+
+      const elStatus = document.getElementById("status");
+      const elTime = document.getElementById("time");
+      const elScore = document.getElementById("score");
+      const elStreak = document.getElementById("streak");
+      const elAcc = document.getElementById("acc");
+      const elHs = document.getElementById("hs");
+      const elWeaponName = document.getElementById("weaponName");
+      const elWeaponRate = document.getElementById("weaponRate");
+      const elWeaponKick = document.getElementById("weaponKick");
+      const elLog = document.getElementById("log");
+
+      const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+      const rand = (a, b) => Math.random() * (b - a) + a;
+
+      let audioCtx = null;
+      function beep(kind = "hit") {
+        try {
+          if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          const o = audioCtx.createOscillator();
+          const g = audioCtx.createGain();
+          const now = audioCtx.currentTime;
+
+          o.type = "sine";
+          o.frequency.value =
+            kind === "hit" ? 650 :
+            kind === "head" ? 880 :
+            kind === "miss" ? 220 :
+            kind === "start" ? 520 :
+            440;
+
+          g.gain.setValueAtTime(0.0001, now);
+          g.gain.exponentialRampToValueAtTime(0.12, now + 0.01);
+          g.gain.exponentialRampToToValueAtTime
+          g.gain.exponentialRampToValueAtTime(0.0001, now + 0.10);
+
+          o.connect(g);
+          g.connect(audioCtx.destination);
+          o.start(now);
+          o.stop(now + 0.12);
+        } catch {
+        }
+      }
+
+      const __fixAudio = true;
+
+      const weapons = {
+        1: { name: "Pistola", rate: 3.5, spread: 2.5, kick: 5, bonus: 1.0 },
+        2: { name: "SMG",     rate: 9.0, spread: 6.5, kick: 3, bonus: 0.75 },
+        3: { name: "Sniper",  rate: 1.2, spread: 0.8, kick: 8, bonus: 1.6 }
+      };
+
+      let weapon = weapons[1];
+
+      function setWeapon(id) {
+        weapon = weapons[id] || weapons[1];
+        elWeaponName.textContent = weapon.name;
+        elWeaponRate.textContent = weapon.rate.toFixed(1);
+        elWeaponKick.textContent =
+          weapon.kick <= 3 ? "leve" : weapon.kick <= 6 ? "médio" : "forte";
+        log(`Arma trocada: ${weapon.name}`);
+      }
+
+      let running = false;
+      let timeLeft = 60.0;
+      let score = 0;
+      let shots = 0;
+      let hits = 0;
+      let headshots = 0;
+      let streak = 0;
+
+      const mouse = { x: canvas.width / 2, y: canvas.height / 2 };
+      let kickX = 0;
+      let kickY = 0;
+
+      let lastShotAt = 0;
+
+      const targets = [];
+      let spawnCooldown = 0;
+
+      function log(msg) {
+        elLog.textContent = msg;
+      }
+
+      function reset() {
+        running = false;
+        timeLeft = 60.0;
+        score = 0;
+        shots = 0;
+        hits = 0;
+        headshots = 0;
+        streak = 0;
+        targets.length = 0;
+        spawnCooldown = 0;
+        kickX = 0;
+        kickY = 0;
+        lastShotAt = 0;
+
+        elStatus.textContent = "Pronto";
+        updateHud();
+        render();
+        log("Enter para começar.");
+      }
+
+      function startPause() {
+        running = !running;
+        elStatus.textContent = running ? "Valendo!" : "Pausado";
+        log(running ? "Boa mira. Respira e vai." : "Pausado. Enter para voltar.");
+        safeBeep(running ? "start" : "miss");
+      }
+
+      function safeBeep(kind) {
+
+        try {
+          if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        } catch {}
+        try { beep(kind); } catch {}
+      }
+
+      function updateHud() {
+        elTime.textContent = timeLeft.toFixed(1);
+        elScore.textContent = score;
+        elStreak.textContent = streak;
+        const acc = shots > 0 ? (hits / shots) * 100 : 0;
+        elAcc.textContent = acc.toFixed(0);
+        elHs.textContent = headshots;
+      }
+
+      function spawnTarget() {
+
+        const progress = clamp((60 - timeLeft) / 60, 0, 1);
+
+        const r = rand(14, 28) * (1 - progress * 0.25);
+        const life = rand(650, 1200) * (1 - progress * 0.30);
+        const speed = rand(0, 1.0 + progress * 1.6);
+
+        const margin = 40;
+        const x = rand(margin, canvas.width - margin);
+        const y = rand(margin, canvas.height - margin);
+
+        targets.push({
+          x, y, r,
+          born: performance.now(),
+          life,
+          vx: rand(-1, 1) * speed,
+          vy: rand(-1, 1) * speed
+        });
+      }
+
+      function shotAllowed(now) {
+        const minGap = 1000 / weapon.rate;
+        return (now - lastShotAt) >= minGap;
+      }
+
+      function shoot() {
+        if (!running) return;
+
+        const now = performance.now();
+        if (!shotAllowed(now)) return;
+
+        lastShotAt = now;
+        shots += 1;
+
+        const spread = weapon.spread;
+        const dx = rand(-spread, spread) + kickX;
+        const dy = rand(-spread, spread) + kickY;
+
+        kickY -= weapon.kick * 0.35;
+        kickX += rand(-0.6, 0.6);
+
+        const sx = mouse.x + dx;
+        const sy = mouse.y + dy;
+
+        let hitIndex = -1;
+        let headshot = false;
+
+        for (let i = targets.length - 1; i >= 0; i--) {
+          const t = targets[i];
+          const dist = Math.hypot(sx - t.x, sy - t.y);
+          if (dist <= t.r) {
+            hitIndex = i;
+            headshot = dist <= t.r * 0.35;
+            break;
+          }
+        }
+
+        if (hitIndex >= 0) {
+          const t = targets[hitIndex];
+          targets.splice(hitIndex, 1);
+
+          hits += 1;
+          streak += 1;
+
+          let pts = Math.round(10 * weapon.bonus + streak * 0.6);
+          if (headshot) {
+            pts += 18;
+            headshots += 1;
+          }
+
+          score += pts;
+
+          elStatus.textContent = headshot ? "HEADSHOT! 🎯" : "Acertou! ✅";
+          log(headshot ? `Headshot! +${pts}` : `Boa! +${pts}`);
+          safeBeep(headshot ? "head" : "hit");
+        } else {
+          streak = 0;
+          score = Math.max(0, score - 4);
+          elStatus.textContent = "Errou 😅";
+          log("Errou… Ajusta a mira.");
+          safeBeep("miss");
+        }
+
+        updateHud();
+
+        flashAt(sx, sy);
+      }
+
+      const flashes = [];
+      function flashAt(x, y) {
+        flashes.push({ x, y, born: performance.now() });
+      }
+
+      function update(dt) {
+        if (!running) return;
+
+        timeLeft -= dt;
+        if (timeLeft <= 0) {
+          timeLeft = 0;
+          running = false;
+          elStatus.textContent = "Fim!";
+          log(`Fim de jogo. Pontos: ${score} | Precisão: ${shots ? ((hits/shots)*100).toFixed(0) : 0}%`);
+          safeBeep("start");
+        }
+
+        const progress = clamp((60 - timeLeft) / 60, 0, 1);
+        const spawnRate = 0.9 + progress * 1.6;
+        spawnCooldown -= dt * spawnRate;
+        while (spawnCooldown <= 0 && running) {
+          spawnTarget();
+          spawnCooldown += 1;
+          if (Math.random() < 0.10 + progress * 0.12) spawnTarget();
+        }
+
+        const now = performance.now();
+        for (let i = targets.length - 1; i >= 0; i--) {
+          const t = targets[i];
+          const age = now - t.born;
+          t.x += t.vx;
+          t.y += t.vy;
+
+          if (t.x < 20 || t.x > canvas.width - 20) t.vx *= -1;
+          if (t.y < 20 || t.y > canvas.height - 20) t.vy *= -1;
+
+          if (age >= t.life) {
+            targets.splice(i, 1);
+            streak = Math.max(0, streak - 1);
+            score = Math.max(0, score - 2);
+          }
+        }
+
+        kickX *= 0.85;
+        kickY *= 0.75;
+
+        updateHud();
+      }
+
+      function render() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        ctx.fillStyle = "#0b0b0b";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(0.5, 0.5, canvas.width - 1, canvas.height - 1);
+
+        const now = performance.now();
+        for (const t of targets) {
+          const age = now - t.born;
+          const lifeLeft = clamp(1 - age / t.life, 0, 1);
+
+          ctx.beginPath();
+          ctx.arc(t.x, t.y, t.r, 0, Math.PI * 2);
+          ctx.closePath();
+          ctx.fillStyle = "#ffffff";
+          ctx.fill();
+
+          ctx.beginPath();
+          ctx.arc(t.x, t.y, t.r + 6, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * lifeLeft);
+          ctx.strokeStyle = "#00ff88";
+          ctx.lineWidth = 3;
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.arc(t.x, t.y, Math.max(2, t.r * 0.15), 0, Math.PI * 2);
+          ctx.fillStyle = "#000000";
+          ctx.fill();
+        }
+
+        for (let i = flashes.length - 1; i >= 0; i--) {
+          const f = flashes[i];
+          const age = now - f.born;
+          if (age > 120) {
+            flashes.splice(i, 1);
+            continue;
+          }
+          const a = 1 - age / 120;
+          ctx.beginPath();
+          ctx.arc(f.x, f.y, 10 + (1 - a) * 10, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(255,255,255,${a})`;
+          ctx.fill();
+        }
+
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "24px monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("+", mouse.x, mouse.y);
+      }
+
+      let last = performance.now();
+      function loop(now) {
+        const dt = (now - last) / 1000;
+        last = now;
+
+        update(dt);
+        render();
+
+        requestAnimationFrame(loop);
+      }
+
+      canvas.addEventListener("mousemove", (e) => {
+        const rect = canvas.getBoundingClientRect();
+        mouse.x = clamp(e.clientX - rect.left, 0, canvas.width);
+        mouse.y = clamp(e.clientY - rect.top, 0, canvas.height);
+      });
+
+      canvas.addEventListener("mousedown", () => {
+        try {
+          if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        } catch {}
+        shoot();
+      });
+
+      // Teclas
+      window.addEventListener("keydown", (e) => {
+        const k = e.key.toLowerCase();
+
+        if (k === "enter") startPause();
+        if (k === "r") reset();
+        if (k === "1") setWeapon(1);
+        if (k === "2") setWeapon(2);
+        if (k === "3") setWeapon(3);
+
+        if (k === " ") {
+          e.preventDefault();
+          shoot();
+        }
+      });
+
+      setWeapon(1);
+      reset();
+      requestAnimationFrame(loop);
+    </script>
+  </body>
+</html>
